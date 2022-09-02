@@ -52,6 +52,7 @@ DigitalOut debugging(PB_1);                   // Led for debug
 float lat = 0, lng = 0;
 int err, svd_pck = 0;
 packet_t data;
+uint8_t bluet[sizeof(packet_t)];
 state_t state = OPEN, last_state = IDLE;
 
 int main() {
@@ -285,21 +286,21 @@ void ble_memory_dump() {
     fileSystem.reformat();
     __enable_irq();
   }
+}
 
-  void ble_send_file(const char *file_to_be_sent) {
-    uint8_t bluet[sizeof(packet_t)];
-    FILE *ble_file = fopen(file_to_be_sent, "a");
+void ble_send_file(const char *file_to_be_sent) {
+  FILE *ble_file = fopen(file_to_be_sent, "a");
 
-    packet_t ble_data; 
+  packet_t ble_data;
 
-    fread((void *)&ble_data, sizeof(packet_t), 1,
-          ble_file); // Write a packet to the file
+  fread((void *)&ble_data, sizeof(packet_t), 1,
+        ble_file); // Write a packet to the file
 
-    memcpy(&bluet, (uint8_t *)&ble_data,
-           sizeof(packet_t)); // Makes narrow conversion to send uint8_t
-                              // format packet by bluetooh
+  memcpy(&bluet, (uint8_t *)&ble_data,
+         sizeof(packet_t)); // Makes narrow conversion to send uint8_t
+                            // format packet by bluetooh
 
-    for (int i = 0; i < sizeof(bluet); i++) {
-      bluetooth.putc(bluet[i]); // Send packet char by char
-    }
+  for (int i = 0; i < sizeof(bluet); i++) {
+    bluetooth.putc(bluet[i]); // Send packet char by char
   }
+}
