@@ -81,8 +81,7 @@ int main() {
     }
   } while (err);
 
-  debugging =
-      1; // Debugging led is on because SD is already mounted, device ready
+  led = 0;
 
   int num_parts = 0,  // Number of parts already saved
       num_files = 0,  // Number of files in SD
@@ -92,7 +91,9 @@ int main() {
   FILE *fp;
   bool first_open = true; // Sinalizes the first open to create a new directory
   setupInterrupts();
-  CAN_IER &= ~CAN_IER_FMPIE0; // Disable RX interrupt
+  // CAN_IER &= ~CAN_IER_FMPIE0; // Disable RX interrupt
+
+  debugging = 1;
 
   t.start();
 
@@ -175,7 +176,7 @@ int main() {
 
 void setupInterrupts() {
   can.attach(&canISR, CAN::RxIrq);
-  bluetooth.attach(&ble_memory_dump, Serial::TxIrq);
+  bluetooth.attach(&ble_memory_dump, Serial::RxIrq);
 }
 
 void canISR() {
@@ -260,6 +261,18 @@ void gps_read() {
 
 void ble_memory_dump() {
   __disable_irq();
+  volatile int i = 0;
+  char receiverBuffer[12];
+  while (bluetooth.readable()) {
+    if (i < 12)
+      receiverBuffer[i++] = bluetooth.getc();
+    else {
+      bluetooth.getc();
+    }
+  }
+  if (!strcmp("R", receiverBuffer[1])) {
+    return;
+  }
 
   DIR *d = opendir("/sd");
   struct dirent *p;
