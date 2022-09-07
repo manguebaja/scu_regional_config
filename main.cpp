@@ -4,6 +4,7 @@
 #include "mbed.h"
 #include <errno.h>
 #include <stdio.h>
+#include <string.h>
 
 /* User libraries */
 #include "CANMsg.h"
@@ -25,6 +26,7 @@ TinyGPSPlus gps;
 /* Communication protocols */
 Serial neogps(PA_2, PA_3, 9600);
 Serial bluetooth(PA_9, PA_10, 9600);
+Serial pc(PB_10, PB_11, 115200);
 CAN can(PB_8, PB_9, 1000000);
 
 /* Interrupt services routine */
@@ -43,57 +45,55 @@ uint32_t count_files_in_sd(const char *fsrc);
 
 /* I/O */
 SDBlockDevice sd(PB_15, PB_14, PB_13, PB_12); // Mosi, miso, sck, cs
-FATFileSystem fileSystem("sd");               // File system declaration
+FATFileSystem fileSystem("SD");               // File system declaration
 DigitalOut led(PC_13);                        // Led for debug
-DigitalOut logger_on(PB_0);                   // Led for debug
-DigitalOut debugging(PB_1);                   // Led for debug
+DigitalOut logger_on(PB_1);                   // Led for debug
+DigitalOut debugging(PB_0);                   // Led for debug
 
 /* Variables */
 float lat = 0, lng = 0;
 int err, svd_pck = 0;
 packet_t data;
-uint8_t bluet[sizeof(packet_t)];
 state_t state = OPEN, last_state = IDLE;
 
 int main() {
   logger_on = 1; // Device is on, so led is on
-  memset(bluet, 0,
-         sizeof(packet_t)); // Prepare serial to send packets of our type
-  int num_parts = 0,        // Number of parts already saved
-      num_files = 0,        // Number of files in SD
-      svd_pck = 0;          // Number of saved packets (in current data part)
-  char name_dir[12];        // Name of current folder (new LOG)
-  char name_file[20];       // Name of current file (dataX)
-  FILE *fp;
-  bool first_open = true; // Sinalizes the first open to create a new directory
-  setupInterrupts();
-  CAN_IER &= ~CAN_IER_FMPIE0; // Disable RX interrupt
-
-  /* Wait for SD mount */
+                 /* Wait for SD mount */
   do {
     debugging = 0; // Debugging led is off untill SD mounted
 
     /* Try to mount the filesystem */
-    // pc.printf("Mounting the filesystem... ");
+    pc.printf("Mounting the filesystem... ");
     fflush(stdout);
 
     err = fileSystem.mount(&sd);
-    // pc.printf("%s\n", (err ? "Fail" : "OK"));
+    pc.printf("%s\n", (err ? "Fail" : "OK"));
     if (err) {
       /* Reformat if we can't mount the filesystem
       this should only happen on the first boot */
-      // pc.printf("No filesystem found, formatting... ");
+      pc.printf("No filesystem found, formatting... ");
       fflush(stdout);
       err = fileSystem.reformat(&sd);
-      // pc.printf("%s\n", (err ? "Fail" : "OK"));
+      // pc.printf("%s\n", (err ? "Failed to format" : "formating: OK"));
       if (err) {
-        error("error: %s (%d)\n", strerror(-err), err);
+        pc.printf("error: Mounting timeout");
       }
     }
   } while (err);
 
   debugging =
       1; // Debugging led is on because SD is already mounted, device ready
+
+  int num_parts = 0,  // Number of parts already saved
+      num_files = 0,  // Number of files in SD
+      svd_pck = 0;    // Number of saved packets (in current data part)
+  char name_dir[12];  // Name of current folder (new LOG)
+  char name_file[20]; // Name of current file (dataX)
+  FILE *fp;
+  bool first_open = true; // Sinalizes the first open to create a new directory
+  setupInterrupts();
+  CAN_IER &= ~CAN_IER_FMPIE0; // Disable RX interrupt
+
   t.start();
 
   while (1) {
@@ -266,7 +266,7 @@ void ble_memory_dump() {
   /* External loop */
   while ((p = readdir(d)) != NULL) {
     if (strcmp(p->d_name, ".Trash-1000")) {
-      break;
+      continue;
     }
 
     char adress[10];
@@ -276,7 +276,7 @@ void ble_memory_dump() {
     /* Internal loop */
     while ((q = readdir(e)) != NULL) {
       if (strcmp(q->d_name, ".Trash-1000")) {
-        break;
+        continue;
       }
       char internalAdress[10];
       sprintf(internalAdress, "%s/%s", adress, q->d_name);
@@ -290,17 +290,17 @@ void ble_memory_dump() {
 
 void ble_send_file(const char *file_to_be_sent) {
   FILE *ble_file = fopen(file_to_be_sent, "a");
+  uint8_t bluet[300 * sizeof(packet_t)];
+  uint8_t *ble_data;
 
-  packet_t ble_data;
-
-  fread((void *)&ble_data, sizeof(packet_t), 1,
+  fread((void *)&ble_data, 300 * sizeof(packet_t), 1,
         ble_file); // Write a packet to the file
 
   memcpy(&bluet, (uint8_t *)&ble_data,
-         sizeof(packet_t)); // Makes narrow conversion to send uint8_t
+         sizeof(ble_data)); // Makes narrow conversion to send uint8_t
                             // format packet by bluetooh
 
-  for (int i = 0; i < sizeof(bluet); i++) {
+  for (int i = 0; i < sizeof(ble_data); i++) {
     bluetooth.putc(bluet[i]); // Send packet char by char
   }
 }
