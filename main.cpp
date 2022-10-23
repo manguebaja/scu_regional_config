@@ -1,23 +1,24 @@
-#include "FATFileSystem.h"
-#include "SDBlockDevice.h"
-#include "TinyGPSPlus.h"
 #include "mbed.h"
-#include <errno.h>
 #include <stdio.h>
-#include <string.h>
+#include <errno.h>
+#include "SDBlockDevice.h"
+#include "FATFileSystem.h"
+#include "TinyGPSPlus.h"
 
 /* User libraries */
-#include "CANMsg.h"
 #include "definitions.h"
+#include "CANMsg.h"
 
 /* State type declaration */
-typedef enum {
-  IDLE,     // Do nothing
-  OPEN,     // Open archive
-  SAVE,     // Save data
-  CLOSE,    // Close archive
-  CAN_STATE // Enter CAN handler
+typedef enum
+{
+    IDLE,       // Do nothing
+    OPEN,       // Open archive
+    SAVE,       // Save data
+    CLOSE,      // Close archive
+    CAN_STATE   // Enter CAN handler
 } state_t;
+
 
 /* Mbed OS Tools */
 Timer t;
@@ -26,294 +27,270 @@ TinyGPSPlus gps;
 /* Communication protocols */
 Serial neogps(PA_2, PA_3, 9600);
 Serial bluetooth(PA_9, PA_10, 9600);
-Serial pc(PB_10, PB_11, 115200);
 CAN can(PB_8, PB_9, 1000000);
 
 /* Interrupt services routine */
 void canISR();
-void ble_memory_dump();
 
 /* Interrupt handlers */
 void canHandler();
 
 /* General functions*/
-void ble_send_file(const char *file_to_be_sent);
 void gps_read();
 void setupInterrupts();
 void filterMessage(CANMsg msg);
 uint32_t count_files_in_sd(const char *fsrc);
 
 /* I/O */
-SDBlockDevice sd(PB_15, PB_14, PB_13, PB_12); // Mosi, miso, sck, cs
-FATFileSystem fileSystem("SD");               // File system declaration
-DigitalOut led(PC_13);                        // Led for debug
-DigitalOut logger_on(PB_1);                   // Led for debug
-DigitalOut debugging(PB_0);                   // Led for debug
+SDBlockDevice   sd(PB_15, PB_14, PB_13, PB_12);     // Mosi, miso, sck, cs
+FATFileSystem   fileSystem("sd");                   // File system declaration
+DigitalOut led(PC_13);                              // Led for debug
+DigitalOut logger_on(PB_0);                              // Led for debug
+DigitalOut debugging(PB_1);                              // Led for debug
 
 /* Variables */
 float lat = 0, lng = 0;
 int err, svd_pck = 0;
 packet_t data;
-state_t state = OPEN, last_state = IDLE;
+uint8_t bluet[sizeof(packet_t)];
+state_t state = OPEN,
+        last_state = IDLE;
 
-int main() {
-  logger_on = 1; // Device is on, so led is on
-                 /* Wait for SD mount */
-  do {
-    debugging = 0; // Debugging led is off untill SD mounted
+int main() 
+{
+    logger_on = 1;                              // Device is on, so led is on
+    memset(bluet,0,sizeof(packet_t));           // Prepare serial to send packets of our type
+    int num_parts = 0,                          // Number of parts already saved
+        num_files = 0,                          // Number of files in SD
+        svd_pck = 0;                            // Number of saved packets (in current data part)
+    char name_dir[12];                          // Name of current folder (new LOG)
+    char name_file[20];                         // Name of current file (dataX)
+    FILE *fp;
+    bool first_open = true;                     // Sinalizes the first open to create a new directory
+    setupInterrupts();
+    CAN_IER &= ~CAN_IER_FMPIE0;                 // Disable RX interrupt
+    
+ /* Wait for SD mount */
+    do
+    {
+        debugging = 0;                          // Debugging led is off untill SD mounted
+        
+        /* Try to mount the filesystem */
+        //pc.printf("Mounting the filesystem... ");
+        fflush(stdout);
 
-    /* Try to mount the filesystem */
-    pc.printf("Mounting the filesystem... ");
-    fflush(stdout);
+        err = fileSystem.mount(&sd);
+        //pc.printf("%s\n", (err ? "Fail" : "OK"));
+        if (err)
+        {
+            /* Reformat if we can't mount the filesystem
+            this should only happen on the first boot */
+            //pc.printf("No filesystem found, formatting... ");
+            fflush(stdout);
+            err = fileSystem.reformat(&sd);
+            //pc.printf("%s\n", (err ? "Fail" : "OK"));
+            if (err) 
+            {
+                error("error: %s (%d)\n", strerror(-err), err);
+            }
+        }
+    }while(err);   
+    
+    debugging = 1;      // Debugging led is on because SD is already mounted, device ready
+    t.start();
+    
+    while(1)
+    {
+        switch (state)
+        {
+            case IDLE:
+                //gps_read();
+                if(last_state == CAN_STATE)
+                {
+                    CAN_IER |= CAN_IER_FMPIE0;          // Enable RX interrupt
+                }
+                last_state = IDLE;
+                
+                break;
+            
+            case OPEN:
+                if(first_open)
+                {
+                    num_files = count_files_in_sd("/sd");
+                    sprintf(name_dir, "%s%d", "/sd/LOG", num_files + 1);
+                    /* Create RUN directory */
+                    mkdir(name_dir, 0777);
+                    first_open = false;
+                }
+            
+                sprintf(name_file, "%s%s%d", name_dir, "/data", num_parts);
+                num_parts++;
+                fp = fopen(name_file, "a");
+            
+                if (fp == NULL)             // If it can't open the file then print error message
+                {
+                    led = 1;
+                }
+             
+                state = IDLE;
+                last_state = OPEN;
+                CAN_IER |= CAN_IER_FMPIE0;  // Enable RX interrupt
+                
+                break;
+                
+            case SAVE:
+                debugging = !debugging;
+                fwrite((void *)&data, sizeof(packet_t), 1, fp);         // Write a packet to the file
+                
+                memcpy(&bluet, (uint8_t *)&data, sizeof(packet_t)); // Makes narrow conversion to send uint8_t format packet by bluetooh
+                bluetooth.putc('e');                                // This char represents the start of a packet
+                for(int i = 0; i < sizeof(bluet); i++)
+                {
+                    bluetooth.putc(bluet[i]);                       // Send packet char by char
+                }
+                //bluetooth.putc('d');                                // This char represents the end of a packet
+                
+                svd_pck++;
+                if(svd_pck == 20)                                         // If 20 packets were wroten, close file
+                {
+                    svd_pck = 0;
+                    last_state = SAVE;
+                    state = CLOSE;
+                }else
+                {
+                    last_state = SAVE;
+                    state = IDLE;
+                    CAN_IER |= CAN_IER_FMPIE0;                          // Enable RX interrupt
+                }
+                
+                break;
+                
+            case CLOSE:
+                CAN_IER &= ~CAN_IER_FMPIE0;                 // Disable RX interrupt
+                fclose(fp);                                 // Close file
+                //NVIC_SystemReset();                       // Reset the system
+                last_state = CLOSE;
+                state = OPEN;
+                
+                break;
+                
+            case CAN_STATE:
+                
+                //led =!led;
+                state = IDLE;
+                canHandler();
+                last_state = CAN_STATE;
+                
+                break;
+                
+            default:
+                break;
+        }
+    } 
+}
 
-    err = fileSystem.mount(&sd);
-    pc.printf("%s\n", (err ? "Fail" : "OK"));
-    if (err) {
-      /* Reformat if we can't mount the filesystem
-      this should only happen on the first boot */
-      pc.printf("No filesystem found, formatting... ");
-      fflush(stdout);
-      err = fileSystem.reformat(&sd);
-      // pc.printf("%s\n", (err ? "Failed to format" : "formating: OK"));
-      if (err) {
-        pc.printf("error: Mounting timeout");
-      }
-    }
-  } while (err);
+void setupInterrupts() 
+{
+    can.attach(&canISR, CAN::RxIrq);
+}
 
-  led = 0;
+void canISR()
+{
+    CAN_IER &= ~CAN_IER_FMPIE0;                   // Disable RX interrupt
+    state = CAN_STATE;
+}
 
-  int num_parts = 0,  // Number of parts already saved
-      num_files = 0,  // Number of files in SD
-      svd_pck = 0;    // Number of saved packets (in current data part)
-  char name_dir[12];  // Name of current folder (new LOG)
-  char name_file[20]; // Name of current file (dataX)
-  FILE *fp;
-  bool first_open = true; // Sinalizes the first open to create a new directory
-  setupInterrupts();
-  // CAN_IER &= ~CAN_IER_FMPIE0; // Disable RX interrupt
+void canHandler()
+{
+      CANMsg rxMsg;
+      can.read(rxMsg);
+      filterMessage(rxMsg);
+      //CAN_IER |= CAN_IER_FMPIE0;                  // Enable RX interrupt
+}
 
-  debugging = 1;
+void filterMessage(CANMsg msg)
+{
+   led = !led;
+   
+  if(msg.id == RPM_ID)
+  {
+      msg >> data.rpm;
+      state = SAVE;
+  }
+  
+  else if(msg.id == TEMPERATURE_ID)
+  {
+      msg >> data.temperature;
+  }
+  
+  else if (msg.id == FLAGS_ID)
+  {
+      msg >> data.flags;
+  }
+  else if (msg.id == IMU_ACC_ID)
+  {
+      msg >> data.imu.acc_x >> data.imu.acc_y >> data.imu.acc_z;
+  }
 
-  t.start();
-
-  while (1) {
-    switch (state) {
-    case IDLE:
-      // gps_read();
-      if (last_state == CAN_STATE) {
-        CAN_IER |= CAN_IER_FMPIE0; // Enable RX interrupt
-      }
-      last_state = IDLE;
-
-      break;
-
-    case OPEN:
-      if (first_open) {
-        num_files = count_files_in_sd("/sd");
-        sprintf(name_dir, "%s%d", "/sd/LOG", num_files + 1);
-        /* Create RUN directory */
-        mkdir(name_dir, 0777);
-        first_open = false;
-      }
-
-      sprintf(name_file, "%s%s%d", name_dir, "/data", num_parts);
-      num_parts++;
-      fp = fopen(name_file, "a");
-
-      if (fp == NULL) // If it can't open the file then print error message
-      {
-        led = 1;
-      }
-
-      state = IDLE;
-      last_state = OPEN;
-      CAN_IER |= CAN_IER_FMPIE0; // Enable RX interrupt
-
-      break;
-
-    case SAVE:
-      debugging = !debugging;
-      fwrite((void *)&data, sizeof(packet_t), 1,
-             fp); // Write a packet to the file
-      svd_pck++;
-      if (svd_pck == 20) // If 20 packets were wroten, close file
-      {
-        svd_pck = 0;
-        last_state = SAVE;
-        state = CLOSE;
-      } else {
-        last_state = SAVE;
-        state = IDLE;
-        CAN_IER |= CAN_IER_FMPIE0; // Enable RX interrupt
-      }
-
-      break;
-
-    case CLOSE:
-      CAN_IER &= ~CAN_IER_FMPIE0; // Disable RX interrupt
-      fclose(fp);                 // Close file
-      // NVIC_SystemReset();                       // Reset the system
-      last_state = CLOSE;
-      state = OPEN;
-
-      break;
-
-    case CAN_STATE:
-
-      // led =!led;
-      state = IDLE;
-      canHandler();
-      last_state = CAN_STATE;
-
-      break;
-
-    default:
-      break;
-    }
+  else if (msg.id == IMU_DPS_ID)
+  {
+      msg >> data.imu.dps_x >> data.imu.dps_y >> data.imu.dps_z;
+  }
+  else if (msg.id == SPEED_ID)
+  {
+      msg >> data.speed;
   }
 }
 
-void setupInterrupts() {
-  can.attach(&canISR, CAN::RxIrq);
-  bluetooth.attach(&ble_memory_dump, Serial::RxIrq);
-}
-
-void canISR() {
-  CAN_IER &= ~CAN_IER_FMPIE0; // Disable RX interrupt
-  state = CAN_STATE;
-}
-
-void canHandler() {
-  CANMsg rxMsg;
-  can.read(rxMsg);
-  filterMessage(rxMsg);
-  // CAN_IER |= CAN_IER_FMPIE0;                  // Enable RX interrupt
-}
-
-void filterMessage(CANMsg msg) {
-  led = !led;
-
-  if (msg.id == RPM_ID) {
-    msg >> data.rpm;
-    state = SAVE;
-  }
-
-  else if (msg.id == TEMPERATURE_ID) {
-    msg >> data.temperature;
-  }
-
-  else if (msg.id == FLAGS_ID) {
-    msg >> data.flags;
-  } else if (msg.id == IMU_ACC_ID) {
-    msg >> data.imu.acc_x >> data.imu.acc_y >> data.imu.acc_z;
-  }
-
-  else if (msg.id == IMU_DPS_ID) {
-    msg >> data.imu.dps_x >> data.imu.dps_y >> data.imu.dps_z;
-  } else if (msg.id == SPEED_ID) {
-    msg >> data.speed;
-  }
-}
-
-uint32_t count_files_in_sd(const char *fsrc) {
-  DIR *d = opendir(fsrc);
-  struct dirent *p;
-  uint32_t counter = 0;
-
-  while ((p = readdir(d)) != NULL) {
-    if (strcmp(p->d_name, ".Trash-1000"))
-      counter++;
-  }
-  closedir(d);
-  return counter;
-}
-
-void gps_read() {
-  CANMsg txMsg;
-  bool newData = false;
-  for (unsigned long start = clock_ms(); clock_ms() - start < 1000;) {
-    if (neogps.readable()) {
-      if (gps.encode(neogps.getc())) {
-        newData = true;
-      }
+uint32_t count_files_in_sd(const char *fsrc)
+{   
+    DIR *d = opendir(fsrc);
+    struct dirent *p;
+    uint32_t counter = 0;
+    
+    while ((p = readdir(d)) != NULL)   
+    {
+        if(strcmp(p->d_name, ".Trash-1000"))
+            counter++;
     }
-  }
-  // If newData is true
-  if (newData == true) {
-    newData = false;
-    if (gps.location.isValid() == 1) {
-      lat = gps.location.lat();
-      lng = gps.location.lng();
-    }
-    // data.latitude = lat;
-    // data.longitude = lng;
-
-    txMsg.clear(LAT_ID);
-    txMsg << lat;
-    if (can.write(txMsg)) {
-      txMsg.clear(LNG_ID);
-      txMsg << lng;
-      can.write(txMsg);
-    }
-  }
+    closedir(d);
+    return counter;
 }
 
-void ble_memory_dump() {
-  __disable_irq();
-  volatile int i = 0;
-  char receiverBuffer[12];
-  while (bluetooth.readable()) {
-    if (i < 12)
-      receiverBuffer[i++] = bluetooth.getc();
-    else {
-      bluetooth.getc();
+void gps_read()
+{
+    CANMsg txMsg;
+    bool newData = false;
+    for (unsigned long start = clock_ms(); clock_ms() - start < 1000;)
+    {
+        if (neogps.readable())
+        {
+            if (gps.encode(neogps.getc()))
+            {
+                newData = true;
+            }
+        }
     }
-  }
-  if (!strcmp("R", receiverBuffer[1])) {
-    return;
-  }
-
-  DIR *d = opendir("/sd");
-  struct dirent *p;
-  /* External loop */
-  while ((p = readdir(d)) != NULL) {
-    if (strcmp(p->d_name, ".Trash-1000")) {
-      continue;
+    // If newData is true
+    if (newData == true)
+    {
+        newData = false;
+        if (gps.location.isValid() == 1)
+        {
+            lat = gps.location.lat();
+            lng = gps.location.lng();
+        }
+        //data.latitude = lat;
+        //data.longitude = lng;
+        
+        txMsg.clear(LAT_ID);
+        txMsg << lat;
+        if(can.write(txMsg))
+        {
+            txMsg.clear(LNG_ID);
+            txMsg << lng;
+            can.write(txMsg);
+        }
+        
     }
-
-    char adress[10];
-    sprintf(adress, "/sd/%s", p->d_name);
-    DIR *e = opendir(adress);
-    struct dirent *q;
-    /* Internal loop */
-    while ((q = readdir(e)) != NULL) {
-      if (strcmp(q->d_name, ".Trash-1000")) {
-        continue;
-      }
-      char internalAdress[10];
-      sprintf(internalAdress, "%s/%s", adress, q->d_name);
-      ble_send_file(internalAdress);
-    }
-
-    fileSystem.reformat();
-    __enable_irq();
-  }
-}
-
-void ble_send_file(const char *file_to_be_sent) {
-  FILE *ble_file = fopen(file_to_be_sent, "a");
-  uint8_t bluet[300 * sizeof(packet_t)];
-  uint8_t *ble_data;
-
-  fread((void *)&ble_data, 300 * sizeof(packet_t), 1,
-        ble_file); // Write a packet to the file
-
-  memcpy(&bluet, (uint8_t *)&ble_data,
-         sizeof(ble_data)); // Makes narrow conversion to send uint8_t
-                            // format packet by bluetooh
-
-  for (int i = 0; i < sizeof(ble_data); i++) {
-    bluetooth.putc(bluet[i]); // Send packet char by char
-  }
 }
